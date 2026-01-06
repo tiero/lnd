@@ -15,18 +15,19 @@ import (
 // mockArkadeClient is a mock implementation of the ArkadeClient interface
 // for testing purposes.
 type mockArkadeClient struct {
-	vtxos              []VTXO
-	balance            btcutil.Amount
-	available          bool
-	fundingTx          *wire.MsgTx
-	signedFundingTx    *wire.MsgTx
-	aspPubKey          *btcec.PublicKey
-	createFundingErr   error
-	signFundingErr     error
-	listVTXOsErr       error
-	getBalanceErr      error
-	refreshErr         error
-	refreshedVTXO      *VTXO
+	vtxos            []VTXO
+	balance          btcutil.Amount
+	available        bool
+	fundingTx        *wire.MsgTx
+	signedFundingTx  *wire.MsgTx
+	serverPubKey     *btcec.PublicKey
+	createFundingErr error
+	signFundingErr   error
+	listVTXOsErr     error
+	getBalanceErr    error
+	renewErr         error
+	renewedVTXO      *VTXO
+	exitDelay        RelativeLocktime
 }
 
 func (m *mockArkadeClient) ListVTXOs(_ context.Context) ([]VTXO, error) {
@@ -61,21 +62,31 @@ func (m *mockArkadeClient) SignFundingTransaction(_ context.Context,
 	return m.signedFundingTx, nil
 }
 
-func (m *mockArkadeClient) RefreshVTXO(_ context.Context,
+func (m *mockArkadeClient) RenewVTXO(_ context.Context,
 	_ string) (*VTXO, error) {
 
-	if m.refreshErr != nil {
-		return nil, m.refreshErr
+	if m.renewErr != nil {
+		return nil, m.renewErr
 	}
-	return m.refreshedVTXO, nil
+	return m.renewedVTXO, nil
 }
 
-func (m *mockArkadeClient) GetASPPubKey(_ context.Context) (*btcec.PublicKey, error) {
-	return m.aspPubKey, nil
+func (m *mockArkadeClient) GetServerPubKey(_ context.Context) (*btcec.PublicKey, error) {
+	return m.serverPubKey, nil
 }
 
 func (m *mockArkadeClient) IsAvailable(_ context.Context) bool {
 	return m.available
+}
+
+func (m *mockArkadeClient) GetUnilateralExitDelay(_ context.Context) (RelativeLocktime, error) {
+	return m.exitDelay, nil
+}
+
+func (m *mockArkadeClient) CollaborativeExit(_ context.Context, _ string,
+	_ uint64) (string, error) {
+
+	return "", nil
 }
 
 // newTestKeyPair generates a new key pair for testing.
@@ -317,9 +328,9 @@ func TestArkadeStateString(t *testing.T) {
 	}
 }
 
-// TestArkadeIntentCreateFundingTxASPUnavailable tests that CreateFundingTx
-// returns an error when the ASP is unavailable.
-func TestArkadeIntentCreateFundingTxASPUnavailable(t *testing.T) {
+// TestArkadeIntentCreateFundingTxServerUnavailable tests that CreateFundingTx
+// returns an error when the Arkade Server is unavailable.
+func TestArkadeIntentCreateFundingTxServerUnavailable(t *testing.T) {
 	t.Parallel()
 
 	fundingAmt := btcutil.Amount(100000)
@@ -346,9 +357,9 @@ func TestArkadeIntentCreateFundingTxASPUnavailable(t *testing.T) {
 	_, remotePub := newTestKeyPair(t)
 	arkIntent.BindKeys(&keychain.KeyDescriptor{PubKey: localPub}, remotePub)
 
-	// Try to create funding tx with unavailable ASP.
+	// Try to create funding tx with unavailable Arkade Server.
 	err = arkIntent.CreateFundingTx(context.Background())
-	require.ErrorIs(t, err, ErrArkadeASPUnavailable)
+	require.ErrorIs(t, err, ErrArkadeServerUnavailable)
 }
 
 // TestArkadeIntentCreateFundingTxInsufficientBalance tests that CreateFundingTx
@@ -407,4 +418,129 @@ func TestVTXOStruct(t *testing.T) {
 	require.Equal(t, btcutil.Amount(50000), vtxo.Amount)
 	require.Equal(t, uint32(700000), vtxo.ExpiryHeight)
 	require.Equal(t, pubKey, vtxo.OwnerPubKey)
+}
+
+// TestRelativeLocktimeSequence tests the Sequence method of RelativeLocktime.
+func TestRelativeLocktimeSequence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		locktime    RelativeLocktime
+		expected    uint32
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name: "block-based locktime",
+			locktime: RelativeLocktime{
+				Type:  0,
+				Value: 144,
+			},
+			expected:  144,
+			expectErr: false,
+		},
+		{
+			name: "time-based locktime",
+			locktime: RelativeLocktime{
+				Type:  1,
+				Value: 144,
+			},
+			// Type flag (1 << 22) | 144
+			expected:  0x400090,
+			expectErr: false,
+		},
+		{
+			name: "max block-based locktime",
+			locktime: RelativeLocktime{
+				Type:  0,
+				Value: 0xffff,
+			},
+			expected:  0xffff,
+			expectErr: false,
+		},
+		{
+			name: "value exceeds maximum",
+			locktime: RelativeLocktime{
+				Type:  0,
+				Value: 0x10000,
+			},
+			expectErr:   true,
+			errContains: "exceeds maximum",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			seq, err := tc.locktime.Sequence()
+
+			if tc.expectErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.errContains)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expected, seq)
+			}
+		})
+	}
+}
+
+// TestLightningChannelScriptBuilder tests the LightningChannelScriptBuilder.
+func TestLightningChannelScriptBuilder(t *testing.T) {
+	t.Parallel()
+
+	_, alicePub := newTestKeyPair(t)
+	_, bobPub := newTestKeyPair(t)
+
+	exitDelay := RelativeLocktime{
+		Type:  0,
+		Value: 144, // 144 blocks
+	}
+
+	builder := NewLightningChannelScriptBuilder(alicePub, bobPub, exitDelay)
+
+	require.Equal(t, alicePub, builder.AliceKey)
+	require.Equal(t, bobPub, builder.BobKey)
+	require.Equal(t, exitDelay, builder.ExitDelay)
+}
+
+// TestBuildLightning2of2Script tests the BuildLightning2of2Script method.
+func TestBuildLightning2of2Script(t *testing.T) {
+	t.Parallel()
+
+	_, alicePub := newTestKeyPair(t)
+	_, bobPub := newTestKeyPair(t)
+
+	builder := NewLightningChannelScriptBuilder(alicePub, bobPub, RelativeLocktime{})
+
+	script, err := builder.BuildLightning2of2Script()
+	require.NoError(t, err)
+	require.NotEmpty(t, script)
+
+	// Verify script contains expected opcodes.
+	// The script should be: <alice_pubkey> OP_CHECKSIG <bob_pubkey> OP_CHECKSIGADD OP_2 OP_NUMEQUAL
+	require.Greater(t, len(script), 64) // At least 2 pubkeys (32 bytes each)
+}
+
+// TestBuildDualPathChannelScripts tests the BuildDualPathChannelScripts method.
+func TestBuildDualPathChannelScripts(t *testing.T) {
+	t.Parallel()
+
+	_, alicePub := newTestKeyPair(t)
+	_, bobPub := newTestKeyPair(t)
+
+	exitDelay := RelativeLocktime{
+		Type:  0,
+		Value: 144,
+	}
+
+	builder := NewLightningChannelScriptBuilder(alicePub, bobPub, exitDelay)
+
+	lightningScript, csvScript, err := builder.BuildDualPathChannelScripts()
+	require.NoError(t, err)
+	require.NotEmpty(t, lightningScript)
+	require.NotEmpty(t, csvScript)
+
+	// CSV script should be longer than Lightning script (includes CSV opcodes)
+	require.Greater(t, len(csvScript), len(lightningScript))
 }

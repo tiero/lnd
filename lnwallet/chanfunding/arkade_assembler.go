@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/keychain"
 )
@@ -30,13 +33,13 @@ var (
 	// expired.
 	ErrArkadeVTXOExpired = errors.New("VTXO has expired")
 
-	// ErrArkadeASPUnavailable is returned when the Ark Service Provider
+	// ErrArkadeServerUnavailable is returned when the Arkade Server
 	// is unavailable.
-	ErrArkadeASPUnavailable = errors.New("ark service provider unavailable")
+	ErrArkadeServerUnavailable = errors.New("arkade server unavailable")
 )
 
 // VTXO represents a Virtual Transaction Output from the Ark protocol.
-// VTXOs are off-chain UTXOs that exist within an ASP's (Ark Service Provider)
+// VTXOs are off-chain UTXOs that exist within an Arkade Server's
 // tree structure and can be used to fund Lightning channels.
 type VTXO struct {
 	// ID is the unique identifier of the VTXO.
@@ -46,8 +49,8 @@ type VTXO struct {
 	Amount btcutil.Amount
 
 	// ExpiryHeight is the block height at which this VTXO expires.
-	// After this height, the VTXO must be refreshed or it will be swept
-	// by the ASP.
+	// After this height, the VTXO must be renewed or it will be swept
+	// by the Arkade Server.
 	ExpiryHeight uint32
 
 	// Outpoint is the on-chain outpoint that anchors this VTXO.
@@ -59,10 +62,55 @@ type VTXO struct {
 
 	// OwnerPubKey is the public key of the VTXO owner.
 	OwnerPubKey *btcec.PublicKey
+
+	// Tapscripts contains the encoded tapscript leaves for this VTXO.
+	Tapscripts []string
+
+	// ExpiresAt is the time at which this VTXO expires.
+	ExpiresAt time.Time
+
+	// Preconfirmed indicates if this VTXO is preconfirmed (instant).
+	Preconfirmed bool
 }
 
-// ArkadeClient is an interface for communicating with an Ark Service Provider
-// (ASP) to manage VTXOs and create channel funding transactions.
+// RelativeLocktime represents a relative timelock that can be either
+// block-based or time-based, following BIP68.
+type RelativeLocktime struct {
+	// Type indicates if this is a block-based or time-based locktime.
+	// 0 = blocks, 1 = time (512 second units)
+	Type uint8
+
+	// Value is the locktime value. For blocks, this is the number of blocks.
+	// For time, this is the number of 512-second intervals.
+	Value uint32
+}
+
+// Sequence returns the BIP68 sequence number for this relative locktime.
+func (r RelativeLocktime) Sequence() (uint32, error) {
+	const (
+		sequenceLocktimeDisableFlag = 1 << 31
+		sequenceLocktimeTypeFlag    = 1 << 22
+		sequenceLocktimeMask        = 0x0000ffff
+	)
+
+	if r.Value > sequenceLocktimeMask {
+		return 0, fmt.Errorf("locktime value %d exceeds maximum %d",
+			r.Value, sequenceLocktimeMask)
+	}
+
+	sequence := r.Value & sequenceLocktimeMask
+	if r.Type == 1 {
+		sequence |= sequenceLocktimeTypeFlag
+	}
+
+	return sequence, nil
+}
+
+// ArkadeClient is an interface for communicating with an Arkade Server
+// (Operator) to manage VTXOs and create channel funding transactions.
+//
+// This interface is designed to be compatible with the Arkade go-sdk
+// (github.com/arkade-os/go-sdk) but can be implemented by any Ark client.
 type ArkadeClient interface {
 	// ListVTXOs returns all VTXOs owned by the wallet that can be used
 	// for channel funding.
@@ -76,26 +124,164 @@ type ArkadeClient interface {
 	// single output at the specified funding address.
 	//
 	// The returned transaction is unsigned and needs to be signed by the
-	// ASP in a collaborative signing round.
+	// Arkade Server in a collaborative signing round.
 	CreateFundingTransaction(ctx context.Context, fundingAddr btcutil.Address,
 		amount btcutil.Amount) (*wire.MsgTx, error)
 
-	// SignFundingTransaction requests the ASP to collaboratively sign
-	// the funding transaction. This is needed because VTXOs require
-	// cooperation from the ASP to spend.
+	// SignFundingTransaction requests the Arkade Server to collaboratively
+	// sign the funding transaction. This is needed because VTXOs require
+	// cooperation from the Arkade Server to spend.
 	SignFundingTransaction(ctx context.Context,
 		tx *wire.MsgTx) (*wire.MsgTx, error)
 
-	// RefreshVTXO requests the ASP to refresh a VTXO, extending its
+	// RenewVTXO requests the Arkade Server to renew a VTXO, extending its
 	// expiry time. This should be called before a VTXO expires.
-	RefreshVTXO(ctx context.Context, vtxoID string) (*VTXO, error)
+	RenewVTXO(ctx context.Context, vtxoID string) (*VTXO, error)
 
-	// GetASPPubKey returns the ASP's public key used for collaborative
-	// signing.
-	GetASPPubKey(ctx context.Context) (*btcec.PublicKey, error)
+	// GetServerPubKey returns the Arkade Server's public key used for
+	// collaborative signing.
+	GetServerPubKey(ctx context.Context) (*btcec.PublicKey, error)
 
-	// IsAvailable checks if the ASP is available and responding.
+	// IsAvailable checks if the Arkade Server is available and responding.
 	IsAvailable(ctx context.Context) bool
+
+	// GetUnilateralExitDelay returns the CSV delay required for
+	// unilateral exit from VTXOs.
+	GetUnilateralExitDelay(ctx context.Context) (RelativeLocktime, error)
+
+	// CollaborativeExit performs a collaborative exit from VTXOs to an
+	// on-chain address. This is faster than unilateral exit but requires
+	// Arkade Server cooperation.
+	CollaborativeExit(ctx context.Context, addr string,
+		amount uint64) (string, error)
+}
+
+// LightningChannelScriptBuilder creates VTXO scripts for Lightning Network
+// channels. It implements the dual-path Taproot structure required by
+// Arkade Lightning Channels:
+//
+// Script Path 1: Standard 2-of-2 multisig (Alice + Bob)
+// Script Path 2: Same 2-of-2 multisig + CSV timeout for Ark unilateral exit
+//
+// This allows:
+// - Normal Lightning operation using standard commitment transactions
+// - Unilateral exit if Arkade Server becomes unavailable
+//
+// The Server key does NOT appear in these scripts. The Server only
+// participates in the VTXO creation (cooperative path), not in Lightning
+// operations.
+//
+// This is inspired by the Arkade go-sdk lightning_channel_scripts example:
+// https://github.com/tiero/go-sdk/blob/master/example/lightning_channel_scripts/main.go
+type LightningChannelScriptBuilder struct {
+	// AliceKey is one channel participant's public key.
+	AliceKey *btcec.PublicKey
+
+	// BobKey is the other channel participant's public key.
+	BobKey *btcec.PublicKey
+
+	// ExitDelay is the CSV delay for unilateral exit.
+	ExitDelay RelativeLocktime
+}
+
+// NewLightningChannelScriptBuilder creates a new Lightning channel script
+// builder.
+//
+// Parameters:
+//   - aliceKey: Public key of first channel participant
+//   - bobKey: Public key of second channel participant
+//   - exitDelay: CSV delay for unilateral exit
+//
+// The resulting scripts create a 2-of-2 multisig channel between Alice and
+// Bob, with an Ark timeout escape hatch for unilateral exit.
+func NewLightningChannelScriptBuilder(aliceKey, bobKey *btcec.PublicKey,
+	exitDelay RelativeLocktime) *LightningChannelScriptBuilder {
+
+	return &LightningChannelScriptBuilder{
+		AliceKey:  aliceKey,
+		BobKey:    bobKey,
+		ExitDelay: exitDelay,
+	}
+}
+
+// BuildLightning2of2Script creates the standard Lightning 2-of-2 multisig
+// script using Tapscript (BIP342).
+//
+// Script: OP_CHECKSIG(Alice) OP_CHECKSIGADD(Bob) OP_2 OP_NUMEQUAL
+//
+// This is a standard BIP342 Tapscript that requires signatures from both
+// Alice and Bob to spend.
+func (l *LightningChannelScriptBuilder) BuildLightning2of2Script() ([]byte, error) {
+	builder := txscript.NewScriptBuilder()
+
+	// Alice's signature check
+	builder.AddData(schnorr.SerializePubKey(l.AliceKey))
+	builder.AddOp(txscript.OP_CHECKSIG)
+
+	// Bob's signature check and accumulate
+	builder.AddData(schnorr.SerializePubKey(l.BobKey))
+	builder.AddOp(txscript.OP_CHECKSIGADD)
+
+	// Require exactly 2 valid signatures
+	builder.AddOp(txscript.OP_2)
+	builder.AddOp(txscript.OP_NUMEQUAL)
+
+	return builder.Script()
+}
+
+// BuildLightningScriptWithCSV adds a CSV timeout to the Lightning script.
+//
+// This creates: <lightning_script> OP_CSV(<delay>)
+//
+// The CSV delay enables unilateral exit if the Arkade Server becomes
+// unavailable. This should NEVER be needed during normal Lightning operation.
+func (l *LightningChannelScriptBuilder) BuildLightningScriptWithCSV(
+	lightningScript []byte) ([]byte, error) {
+
+	// Convert exit delay to CSV sequence
+	csvSequence, err := l.ExitDelay.Sequence()
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert exit delay to "+
+			"CSV sequence: %w", err)
+	}
+
+	builder := txscript.NewScriptBuilder()
+
+	// Add the original Lightning script as raw opcodes
+	builder.AddOps(lightningScript)
+
+	// Add CSV timeout
+	builder.AddInt64(int64(csvSequence))
+	builder.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
+	builder.AddOp(txscript.OP_DROP)
+
+	return builder.Script()
+}
+
+// BuildDualPathChannelScripts creates the dual-path Taproot structure for
+// Lightning channel funding outputs.
+//
+// Returns:
+//   - lightningScript: Standard 2-of-2 multisig for normal operation
+//   - csvScript: Same multisig + CSV timeout for unilateral exit
+//   - error: Any error encountered
+func (l *LightningChannelScriptBuilder) BuildDualPathChannelScripts() (
+	lightningScript, csvScript []byte, err error) {
+
+	// Standard Lightning 2-of-2 multisig script
+	lightningScript, err = l.BuildLightning2of2Script()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to build Lightning "+
+			"script: %w", err)
+	}
+
+	// Lightning script + CSV timeout for Ark unilateral exit
+	csvScript, err = l.BuildLightningScriptWithCSV(lightningScript)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to build CSV script: %w", err)
+	}
+
+	return lightningScript, csvScript, nil
 }
 
 // ArkadeState represents the state of the Arkade funding intent.
@@ -115,7 +301,7 @@ const (
 	ArkadeStateFundingCreated
 
 	// ArkadeStateFundingSigned indicates the funding transaction has
-	// been signed by the ASP.
+	// been signed by the Arkade Server.
 	ArkadeStateFundingSigned
 
 	// ArkadeStateComplete indicates the funding process is complete.
@@ -156,10 +342,10 @@ type ArkadeIntent struct {
 	// State is the current state of the Arkade funding intent.
 	State ArkadeState
 
-	// client is the Arkade client used to communicate with the ASP.
+	// client is the Arkade client used to communicate with the Arkade Server.
 	client ArkadeClient
 
-	// fundingTx is the funding transaction created by the ASP.
+	// fundingTx is the funding transaction created by the Arkade Server.
 	fundingTx *wire.MsgTx
 
 	// selectedVTXOs are the VTXOs selected to fund the channel.
@@ -196,7 +382,7 @@ func (i *ArkadeIntent) BindKeys(localKey *keychain.KeyDescriptor,
 }
 
 // CreateFundingTx creates the funding transaction by selecting VTXOs and
-// requesting the ASP to create a transaction that funds the channel.
+// requesting the Arkade Server to create a transaction that funds the channel.
 func (i *ArkadeIntent) CreateFundingTx(ctx context.Context) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -210,9 +396,9 @@ func (i *ArkadeIntent) CreateFundingTx(ctx context.Context) error {
 		return ErrArkadeNotConfigured
 	}
 
-	// Check ASP availability.
+	// Check Arkade Server availability.
 	if !i.client.IsAvailable(ctx) {
-		return ErrArkadeASPUnavailable
+		return ErrArkadeServerUnavailable
 	}
 
 	// Get the funding output to determine the address.
@@ -241,7 +427,7 @@ func (i *ArkadeIntent) CreateFundingTx(ctx context.Context) error {
 			ErrInsufficientVTXOBalance, balance, fundingAmt)
 	}
 
-	// Request the ASP to create the funding transaction.
+	// Request the Arkade Server to create the funding transaction.
 	tx, err := i.client.CreateFundingTransaction(ctx, fundingAddr, fundingAmt)
 	if err != nil {
 		return fmt.Errorf("unable to create funding tx: %w", err)
@@ -253,7 +439,7 @@ func (i *ArkadeIntent) CreateFundingTx(ctx context.Context) error {
 	return nil
 }
 
-// SignFundingTx requests the ASP to sign the funding transaction.
+// SignFundingTx requests the Arkade Server to sign the funding transaction.
 func (i *ArkadeIntent) SignFundingTx(ctx context.Context) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -267,7 +453,7 @@ func (i *ArkadeIntent) SignFundingTx(ctx context.Context) error {
 		return ErrArkadeNotConfigured
 	}
 
-	// Request the ASP to sign the funding transaction.
+	// Request the Arkade Server to sign the funding transaction.
 	signedTx, err := i.client.SignFundingTransaction(ctx, i.fundingTx)
 	if err != nil {
 		return fmt.Errorf("unable to sign funding tx: %w", err)
@@ -382,7 +568,7 @@ type ArkadeAssembler struct {
 	// fundingAmt is the total amount of coins in the funding output.
 	fundingAmt btcutil.Amount
 
-	// client is the Arkade client used to communicate with the ASP.
+	// client is the Arkade client used to communicate with the Arkade Server.
 	client ArkadeClient
 
 	// netParams are the network parameters.
@@ -410,7 +596,7 @@ func NewArkadeAssembler(fundingAmt btcutil.Amount, client ArkadeClient,
 // NOTE: This method satisfies the chanfunding.Assembler interface.
 func (a *ArkadeAssembler) ProvisionChannel(req *Request) (Intent, error) {
 	// SubtractFees is not supported for Arkade funding as the transaction
-	// is assembled by the ASP.
+	// is assembled by the Arkade Server.
 	if req.SubtractFees {
 		return nil, fmt.Errorf("SubtractFees not supported for " +
 			"Arkade funding")
