@@ -407,9 +407,12 @@ func (i *ArkadeIntent) CreateFundingTx(ctx context.Context) error {
 		return fmt.Errorf("unable to create funding output: %w", err)
 	}
 
-	// Parse the funding script to get the address.
+	// Parse the funding script to get the address. The P2WSH script starts
+	// with a version byte (0x00) and a length byte (0x20 for 32 bytes),
+	// so we skip the first 2 bytes to get the script hash.
+	const p2wshScriptHashOffset = 2
 	fundingAddr, err := btcutil.NewAddressWitnessScriptHash(
-		txOut.PkScript[2:], i.netParams,
+		txOut.PkScript[p2wshScriptHashOffset:], i.netParams,
 	)
 	if err != nil {
 		return fmt.Errorf("unable to parse funding address: %w", err)
@@ -615,9 +618,10 @@ func (a *ArkadeAssembler) ProvisionChannel(req *Request) (Intent, error) {
 
 	intent := &ArkadeIntent{
 		ShimIntent: ShimIntent{
-			localFundingAmt: a.fundingAmt,
-			musig2:          req.Musig2,
-			tapscriptRoot:   req.TapscriptRoot,
+			localFundingAmt:  req.LocalAmt,
+			remoteFundingAmt: req.RemoteAmt,
+			musig2:           req.Musig2,
+			tapscriptRoot:    req.TapscriptRoot,
 		},
 		State:       ArkadeStateInit,
 		client:      a.client,
